@@ -1,0 +1,267 @@
+# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+
+name: Node.js Package
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm test
+
+  publish-gpr:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com/
+      - run: npm ci
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+"""
+HealthLink Access — AI Chatbot Service (FastAPI)
+Public name: HealthLink Assistant
+Author/Contact: Ahmad Faguji
+Purpose: Provide bilingual (English/Hausa), educational medication guidance using Firestore + OpenAI.
+Logs chats to Firestore (collection 'chats') for admin analytics.
+"""
+
+import os
+import json
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+import openai
+from google.cloud import firestore
+
+# Load environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+LOGGING_ADMIN_NAME = os.getenv("ADMIN_NAME", "Ahmad Faguji")
+PUBLIC_BOT_NAME = os.getenv("PUBLIC_BOT_NAME", "HealthLink Assistant")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is required.")
+if not FIREBASE_PROJECT_ID:
+    raise RuntimeError("FIREBASE_PROJECT_ID environment variable is required.")
+
+openai.api_key = OPENAI_API_KEY
+
+# Initialize Firestore client (requires GOOGLE_APPLICATION_CREDENTIALS set in environment)
+db = firestore.Client(project=FIREBASE_PROJECT_ID)
+
+app = FastAPI(title=PUBLIC_BOT_NAME, version="1.1")
+
+# Allow CORS from your frontend domain(s); use '*' for quick testing (not for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# Request / Response models
+class ChatRequest(BaseModel):
+    userId: Optional[str] = None
+    message: str
+    language: Optional[str] = "en"         # 'en' or 'ha'
+    metadata: Optional[Dict[str, Any]] = None
+
+class ChatResponse(BaseModel):
+    success: bool
+    ai_reply: str
+    language: str
+    drug_data_found: bool
+    chat_id: Optional[str] = None
+
+# Firestore lookup
+def find_drug_in_firestore(drug_query: str):
+    try:
+        collection_ref = db.collection("drugs")
+        key = drug_query.strip()
+        docs = collection_ref.where("drugName", "==", key).limit(1).stream()
+        for doc in docs:
+            return doc.to_dict()
+        docs = collection_ref.where("drugName", "==", key.lower()).limit(1).stream()
+        for doc in docs:
+            return doc.to_dict()
+        docs = collection_ref.where("drugName", ">=", key).where("drugName", "<=", key + "\uf8ff").limit(5).stream()
+        for doc in docs:
+            return doc.to_dict()
+        pieces = key.split()
+        for p in pieces:
+            docs = collection_ref.where("drugName", ">=", p).where("drugName", "<=", p + "\uf8ff").limit(1).stream()
+            for doc in docs:
+                return doc.to_dict()
+        return None
+    except Exception as e:
+        print("[Firestore lookup error]", e)
+        return None
+
+# Build prompts
+def build_system_prompt(language: str):
+    lang_name = "Hausa" if language == "ha" else "English"
+    return (
+        f"You are {PUBLIC_BOT_NAME}, an educational clinical pharmacist aide. "
+        f"Always act as an educational resource (never diagnose). "
+        f"Ask short clarifying questions if the user's report is incomplete. "
+        f"When giving answers include: brief likely explanation (non-diagnostic), "
+        f"medication options (with dosage ranges if available), simple food/treatment advice, "
+        f"and a short safety/disclaimer line. Respond in {lang_name}. Keep answers concise and practical."
+    )
+
+def compose_prompt(user_message: str, drug_info: Optional[dict], language: str):
+    drug_section = ""
+    if drug_info:
+        drug_section = (
+            "=== LOCAL DRUG DATA ===\n"
+            f"DrugName: {drug_info.get('drugName')}\n"
+            f"Class: {drug_info.get('class')}\n"
+            f"Indications: {drug_info.get('indications')}\n"
+            f"Dosage: {drug_info.get('dosage')}\n"
+            f"SideEffects: {drug_info.get('sideEffects')}\n"
+            f"Interactions: {drug_info.get('interactions')}\n"
+            f"Contraindications: {drug_info.get('contraindications')}\n\n"
+        )
+    user_section = f"User query: {user_message}\n"
+    return drug_section + user_section
+
+def call_openai_for_reply(prompt_messages, max_tokens=450, temperature=0.2):
+    try:
+        resp = openai.ChatCompletion.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=prompt_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        choice = resp.get("choices", [])[0]
+        msg = choice.get("message") or {}
+        text = msg.get("content", "").strip()
+        return text
+    except Exception as e:
+        print("[OpenAI Error]", e)
+        return None
+
+# Logging
+def log_chat_to_firestore(user_id: Optional[str], user_message: str, ai_reply: str, language: str, drug_found: bool, metadata: Optional[dict]):
+    try:
+        doc_ref = db.collection("chats").document()
+        payload = {
+            "userId": user_id or "anonymous",
+            "userMessage": user_message,
+            "aiReply": ai_reply,
+            "language": language,
+            "drugDataFound": bool(drug_found),
+            "metadata": metadata or {},
+            "adminName": LOGGING_ADMIN_NAME,
+            "createdAt": datetime.now(timezone.utc).isoformat()
+        }
+        doc_ref.set(payload)
+        return doc_ref.id
+    except Exception as e:
+        print("[Chat Log Error]", e)
+        return None
+
+# Emergency detection
+RED_FLAG_KEYWORDS = [
+    "chest pain", "severe bleeding", "unconscious", "difficulty breathing", "shortness of breath",
+    "collapse", "not breathing", "severe allergic"
+]
+
+def contains_red_flag(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in RED_FLAG_KEYWORDS)
+
+# Endpoints
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": PUBLIC_BOT_NAME, "admin": LOGGING_ADMIN_NAME}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest):
+    user_msg = (req.message or "").strip()
+    lang = (req.language or "en").lower()
+    uid = req.userId or "anonymous"
+    metadata = req.metadata or {}
+
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    if contains_red_flag(user_msg):
+        urgent_text = (
+            "This message may indicate a medical emergency. Please seek immediate medical attention "
+            "or contact local emergency services right away."
+        )
+        chat_id = log_chat_to_firestore(uid, user_msg, urgent_text, lang, False, metadata)
+        return JSONResponse({
+            "success": True,
+            "ai_reply": urgent_text,
+            "language": lang,
+            "drug_data_found": False,
+            "chat_id": chat_id
+        })
+
+    drug_info = find_drug_in_firestore(user_msg)
+
+    if drug_info:
+        parts = [
+            f"Drug: {drug_info.get('drugName')}",
+            f"Class: {drug_info.get('class')}",
+            f"Indications: {drug_info.get('indications')}",
+            f"Dosage: {drug_info.get('dosage')}",
+            f"Side effects: {drug_info.get('sideEffects')}",
+            f"Interactions: {drug_info.get('interactions')}",
+            f"Contraindications: {drug_info.get('contraindications')}",
+            f"Pharmacokinetics: {drug_info.get('pharmacokinetics')}",
+            "Disclaimer: This is educational information only. Consult a healthcare professional for personal advice."
+        ]
+        reply_text = "\n".join(parts)
+        chat_id = log_chat_to_firestore(uid, user_msg, reply_text, lang, True, metadata)
+        return JSONResponse({
+            "success": True,
+            "ai_reply": reply_text,
+            "language": lang,
+            "drug_data_found": True,
+            "chat_id": chat_id
+        })
+
+    system_prompt = build_system_prompt(lang)
+    user_context = compose_prompt(user_msg, None, lang)
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_context}]
+
+    ai_text = call_openai_for_reply(messages)
+    if ai_text is None:
+        error_text = "Sorry, I encountered an internal error while processing your request. Please try again later."
+        chat_id = log_chat_to_firestore(uid, user_msg, error_text, lang, False, metadata)
+        raise HTTPException(status_code=500, detail=error_text)
+
+    chat_id = log_chat_to_firestore(uid, user_msg, ai_text, lang, False, metadata)
+
+    return JSONResponse({
+        "success": True,
+        "ai_reply": ai_text,
+        "language": lang,
+        "drug_data_found": False,
+        "chat_id": chat_id
+    })
